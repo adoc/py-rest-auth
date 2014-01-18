@@ -66,13 +66,15 @@ class AuthApi(object):
                 h.update(arg.encode())            
         return base64.b64encode(h.digest()).decode(encoding='utf-8')
 
-    def unsign(self, secret, timestamp, signature, *args):
+    def unsign(self, secret, timestamp, signature, *args, **kwa):
         """
         """
+        threshold = kwa.get('threshold', self.threshold) * 1000
+
         timestamp = int(timestamp)
         utcnow = int(self.time_provider())
         delta = utcnow - timestamp;
-        if abs(delta) > self.threshold*1000:
+        if abs(delta) > threshold:
             raise SignatureTimeout("Signature it too old. %s:%s" %
                                     (utcnow, timestamp))
         challenge = self.sign(secret, str(timestamp), *args)
@@ -80,40 +82,40 @@ class AuthApi(object):
             raise SignatureBad("Incorrect HMAC challenge. %s:%s" %
                                 (signature, challenge))
 
-    def send(self, remote_id, payload):
+    def send(self, remote_id, payload, *args):
         """
         """
         secret = self.remotes[remote_id]
         now = int(self.time_provider())
 
         payload = json_dumps(payload)
-        meta = json_dumps({'_cid': self.sender_id})
         now = json_dumps(now)
 
-        return (self.sign(secret, now, payload, meta), now)
+        return (self.sign(secret, now, payload, self.sender_id ,*args), now)
 
-    def receive(self, remote_id, timestamp, signature, payload):
+    def receive(self, remote_id, timestamp, signature, payload, *args, **kwa):
         """
         """
         if not remote_id in self.remotes:
             raise ClientBad("Remote id %s is not a valid client." % remote_id)
 
         payload = json_dumps(payload)
-        meta = json_dumps({'_cid': remote_id})
         secret = self.remotes[remote_id]
 
-        self.unsign(secret, timestamp, signature, payload, meta)
+        self.unsign(secret, timestamp, signature, payload, remote_id, *args, **kwa)
 
 
 class PyramidAuthApiServer(AuthApi):
     """
     """
     def __init__(self, sender_id, remotes={}, passes=100, threshold=600,
-                    time_provider=time.time, header_signature='',
-                    header_timestamp='', header_remoteid=''):
+                    tight_threshold=15, time_provider=time.time,
+                    header_signature='', header_timestamp='',
+                    header_remoteid=''):
         """
         """
         AuthApi.__init__(self, sender_id, remotes, passes, threshold, time.time)
+        self.tight_threshold = tight_threshold
         self.header_signature = header_signature or 'X-Signature'
         self.header_timestamp = header_timestamp or 'X-Signature-Timestamp'
         self.header_remoteid = header_remoteid or 'X-Client-Id'
@@ -133,7 +135,8 @@ class PyramidAuthApiServer(AuthApi):
         response.headers[self.header_timestamp] = now
         response.headers[self.header_remoteid] = self.sender_id
 
-    def receive(self, request, default_type=collections.OrderedDict):
+    def receive(self, request, tight=True,
+                    default_type=collections.OrderedDict):
         """
         """
         # Get or construct a new payload.
@@ -149,41 +152,81 @@ class PyramidAuthApiServer(AuthApi):
         timestamp = int(request.headers.get(self.header_timestamp, 0))
         remote_id = str(request.headers.get(self.header_remoteid, ''))
 
-        # Invoke the Api.
-        AuthApi.receive(self, remote_id, timestamp, signature, payload)
+        def try_tight():
+            args = (request.client_addr,)
+            kwa = {'threshold': self.tight_threshold}
+            # Invoke the Api.
+            AuthApi.receive(self, remote_id, timestamp, signature, payload, *args, **kwa)            
+
+        if tight:
+            try_tight()
+        else:
+            args = ()
+            kwa = {}
+            try:
+                # Try loose receive since tight is not required.
+                AuthApi.receive(self, remote_id, timestamp, signature, payload, *args, **kwa)
+            except AuthException:
+                # Now just run a tight receive in case those params were sent on the client.
+                try_tight()
 
 
-# Pyramid View Config
-# ===================
+# Pyramid Stuff
+# =============
 try:
     import pyramid
 except ImportError:
-    # Log something here.
     log.info("Pyramid is unavailable. You won't be able to use "
                 "`auth_view_config`")
 else:
     import pyramid.httpexceptions as exc
     from pyramid.view import view_config
 
-    def auth_view_config(model_type, *args, **kwa):
-        """
-        """
+    # Just a commonly used kwarg handler.
+    def _common_kwa(kwa):
         if 'registry_key' in kwa:
             registry_key = kwa['registry_key']
             del kwa['registry_key']
         else:
             registry_key = 'auth_api'
 
+        if 'tight_auth' in kwa:
+            tight_auth = kwa['tight_auth']
+            del kwa['tight_auth']
+        else:
+            tight_auth = True
+        return registry_key, tight_auth
+
+    # Commonly code useds by authenticated views.
+    def _auth_view(request, auth_api, tight=True,
+                    model_type=collections.OrderedDict):
+
+        try:
+            auth_api.receive(request, tight=tight, default_type=model_type)
+        except AuthException as e:
+            # Log and throw HTTP exception.
+            log.warn("AuthException: %s" % e)
+            raise exc.HTTPForbidden()            
+
+        # Set up response callback for sending.
+        request.add_response_callback(auth_api.send)
+
+        return request
+
+
+    def auth_view_config(model_type, *args, **kwa):
+        """Pyramid view decorator to require authentication on the
+        view_config callable.
+        """
+        registry_key, tight_auth = _common_kwa(kwa)
+
         def decorator(view_callable):
             def _inner(request):
-                # Get the Auth API.
+                # Get the Auth API from the registry..
                 auth_api = request.registry.settings[registry_key]
 
-                # Handle receipt
-                auth_api.receive(request, default_type=model_type)
-
-                # Set up response callback for sending.
-                request.add_response_callback(auth_api.send)
+                request = _auth_view(request, auth_api, tight=tight_auth,
+                                        model_type=model_type)
 
                 return view_callable(request)
                 
@@ -191,3 +234,19 @@ else:
             kwa['_depth'] = 1 # instruct venusian to do something. (??)
             return view_config(*args, **kwa)(_inner)
         return decorator
+
+
+    def ping_view(**kwa):
+        """Pyramid view callable to return basic information used to
+        tighten the security of the auth.
+        """
+        registry_key, _ = _common_kwa(kwa)
+
+        def ping(request):
+            auth_api = request.registry.settings[registry_key]
+
+            request = _auth_view(request, auth_api, tight=False)
+            return {'_addr': request.client_addr,
+                    '_time': int(auth_api.time_provider())}
+
+        return ping

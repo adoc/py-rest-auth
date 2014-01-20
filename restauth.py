@@ -216,7 +216,7 @@ else:
 
     def auth_view_config(model_type, *args, **kwa):
         """Pyramid view decorator to require authentication on the
-        view_config callable.
+        view-callable.
         """
         registry_key, tight_auth = _common_kwa(kwa)
 

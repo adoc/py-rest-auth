@@ -51,17 +51,12 @@ class AuthApi(object):
         self.threshold = threshold
         self.time_provider = time_provider
 
-    def sign(self, secret, timestamp, *args):
+    def sign(self, *args):
         """Tighter HMAC-SHA256 that uses the UTC timestamp and multiple
         passes.
         """
-        #print(timestamp)
-        #print(args[0])
-        #print(args[1])
-        
-        h = hmac.new(secret.encode(), None, hashlib.sha256)
+        h = hmac.new(args[0].encode(), None, hashlib.sha256)
         for i in range(self.passes):
-            h.update(timestamp.encode())
             for arg in args:
                 h.update(arg.encode())            
         return base64.b64encode(h.digest()).decode(encoding='utf-8')
@@ -123,17 +118,20 @@ class PyramidAuthApiServer(AuthApi):
     def send(self, request, response):
         """
         """
-        # Prepare some data for signing.
-        remote_id = str(request.headers.get(self.header_remoteid, ''))
-        payload = json_loads(response.body.decode('utf-8'))        
+        body = response.body.decode('utf-8')
+        if body:
+            # Prepare some data for signing.
+            remote_id = str(request.headers.get(self.header_remoteid, ''))
 
-        # Invoke the Api.
-        sig, now = AuthApi.send(self, remote_id, payload)
+            payload = json_loads(body)
+        
+            # Invoke the Api.
+            sig, now = AuthApi.send(self, remote_id, payload)
 
-        # Add HTTP Headers.
-        response.headers[self.header_signature] = sig
-        response.headers[self.header_timestamp] = now
-        response.headers[self.header_remoteid] = self.sender_id
+            # Add HTTP Headers.
+            response.headers[self.header_signature] = sig
+            response.headers[self.header_timestamp] = now
+            response.headers[self.header_remoteid] = self.sender_id
 
     def receive(self, request, tight=True,
                     default_type=collections.OrderedDict):
@@ -179,74 +177,83 @@ except ImportError:
     log.info("Pyramid is unavailable. You won't be able to use "
                 "`auth_view_config`")
 else:
-    import pyramid.httpexceptions as exc
+    from pyramid.security import Everyone, Authenticated
     from pyramid.view import view_config
 
-    # Just a commonly used kwarg handler.
-    def _common_kwa(kwa):
-        if 'registry_key' in kwa:
-            registry_key = kwa['registry_key']
-            del kwa['registry_key']
-        else:
-            registry_key = 'auth_api'
+    import pyramid.httpexceptions as exc
+    from pyramid.security import authenticated_userid
 
-        if 'tight_auth' in kwa:
-            tight_auth = kwa['tight_auth']
-            del kwa['tight_auth']
-        else:
-            tight_auth = True
-        return registry_key, tight_auth
-
-    # Commonly code useds by authenticated views.
-    def _auth_view(request, auth_api, tight=True,
-                    model_type=collections.OrderedDict):
-
-        try:
-            auth_api.receive(request, tight=tight, default_type=model_type)
-        except AuthException as e:
-            # Log and throw HTTP exception.
-            log.warn("AuthException: %s" % e)
-            raise exc.HTTPForbidden()            
-
-        # Set up response callback for sending.
-        request.add_response_callback(auth_api.send)
-
-        return request
+    Guest = 'restauth.Guest'
+    TightGuest = 'restauth.TightGuest'
 
 
-    def auth_view_config(model_type, *args, **kwa):
-        """Pyramid view decorator to require authentication on the
-        view-callable.
-        """
-        registry_key, tight_auth = _common_kwa(kwa)
-
-        def decorator(view_callable):
-            def _inner(request):
-                # Get the Auth API from the registry..
-                auth_api = request.registry.settings[registry_key]
-
-                request = _auth_view(request, auth_api, tight=tight_auth,
-                                        model_type=model_type)
-
-                return view_callable(request)
-                
-            _inner.__name__ = view_callable.__name__
-            kwa['_depth'] = 1 # instruct venusian to do something. (??)
-            return view_config(*args, **kwa)(_inner)
-        return decorator
 
 
-    def ping_view(**kwa):
+    def ping_view(request):
         """Pyramid view callable to return basic information used to
         tighten the security of the auth.
         """
-        registry_key, _ = _common_kwa(kwa)
+        data = {'_addr': request.client_addr,
+                '_time': int(request.auth_api.time_provider())}
 
-        def ping(request):
-            auth_api = request.registry.settings[registry_key]
+        client_id = authenticated_userid(request);
 
-            request = _auth_view(request, auth_api, tight=False)
-            return {'_addr': request.client_addr,
-                    '_time': int(auth_api.time_provider())}
+        if client_id:
+           data['clientId'] = client_id
 
-        return ping
+        return data
+
+
+    class RestAuthHelper(PyramidAuthApiServer):
+        def parse_userid(self, request):
+            return str(request.headers.get(self.header_remoteid, ''))
+
+        def add_client(self, client_id, secret):
+            self.remotes.update({client_id: secret})
+
+
+    class RestAuthnPolicy(object):
+        """ """
+
+        def __init__(self, *args, **kwa):
+            self.helper = RestAuthHelper(*args, **kwa)
+            self.authenticated = set()
+
+        def remember(self, request, principal, **kw):
+            #print(**kw)
+            self.helper.add_client(principal, kw['secret'])
+            self.authenticated.add(principal)
+
+        def forget(self, request):
+            print ("FORGET ME!")
+
+        def unauthenticated_userid(self, request):
+            return self.helper.parse_userid(request)
+
+        def authenticated_userid(self, request):
+            userid = self.unauthenticated_userid(request)
+            if userid in self.authenticated:
+                return userid
+
+        def effective_principals(self, request):
+            principals = [Everyone]
+            request.set_property(lambda t: self.helper, 'auth_api')
+            remote_id = self.helper.parse_userid(request)
+
+            try:
+                self.helper.receive(request, tight=False)
+            except AuthException as e:
+                return principals
+            else:
+                request.add_response_callback(self.helper.send)
+
+                try:
+                    self.helper.receive(request, tight=True)
+                except AuthException as e:
+                    return principals + [Guest]
+                else:
+                    if remote_id == 'guest':
+                        return principals + [TightGuest]
+                    else:
+                        return principals + [Authenticated, 
+                                        'u:%s' % remote_id]

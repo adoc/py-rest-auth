@@ -1,119 +1,38 @@
+import os
 import time
-import json
 import base64
-import hmac
 import hashlib
 import collections
 import functools
 import logging
 
+from whmac import SignatureException
+from message import json, JsonAuthApi, Remotes, AuthException
 
 # Set up logging.
 log = logging.getLogger(__name__)
 
 
-# Provides consistency for serialization/hashing.
-json_dumps = functools.partial(json.dumps, separators=(',', ':'))
-json_loads = functools.partial(json.loads,
-                                object_pairs_hook=collections.OrderedDict)
-
-
-# Exceptions
-# ==========
-class AuthException(Exception):
-    pass
-
-
-class SignatureBad(AuthException):
-    pass
-
-
-class ClientBad(AuthException):
-    pass
-
-
-class SignatureTimeout(AuthException):
-    pass
-
-
 # Main Api
 # ========
-class AuthApi(object):
+class PyramidAuthApi(JsonAuthApi):
     """
     """
-    def __init__(self, sender_id, remotes={}, passes=100, threshold=600,
-                    time_provider=time.time):
+    def __init__(self, sender_id, remotes={}, expiry=600, tight_expiry=5):
         """
         """
-        self.sender_id = sender_id
-        self.remotes = remotes
-        self.passes = passes
-        self.threshold = threshold
-        self.time_provider = time_provider
+        JsonAuthApi.__init__(self, sender_id, remotes=Remotes(remotes))
+        self.expiry = expiry
+        self.tight_expiry = tight_expiry
+        
+    def parse_sender_id(self, request):
+        return str(request.headers.get('X-Restauth-Sender-Id', ''))
 
-    def sign(self, *args):
-        """Tighter HMAC-SHA256 that uses the UTC timestamp and multiple
-        passes.
-        """
-        h = hmac.new(args[0].encode(), None, hashlib.sha256)
-        for i in range(self.passes):
-            for arg in args:
-                h.update(arg.encode())            
-        return base64.b64encode(h.digest()).decode(encoding='utf-8')
+    def parse_signature(self, request):
+        return str(request.headers.get('X-Restauth-Signature', ''))
 
-    def unsign(self, secret, timestamp, signature, *args, **kwa):
-        """
-        """
-        threshold = kwa.get('threshold', self.threshold) * 1000
-
-        timestamp = int(timestamp)
-        utcnow = int(self.time_provider())
-        delta = utcnow - timestamp;
-        if abs(delta) > threshold:
-            raise SignatureTimeout("Signature it too old. %s:%s" %
-                                    (utcnow, timestamp))
-        challenge = self.sign(secret, str(timestamp), *args)
-        if signature != challenge:
-            raise SignatureBad("Incorrect HMAC challenge. %s:%s" %
-                                (signature, challenge))
-
-    def send(self, remote_id, payload, *args):
-        """
-        """
-        secret = self.remotes[remote_id]
-        now = int(self.time_provider())
-
-        payload = json_dumps(payload)
-        now = json_dumps(now)
-
-        return (self.sign(secret, now, payload, self.sender_id ,*args), now)
-
-    def receive(self, remote_id, timestamp, signature, payload, *args, **kwa):
-        """
-        """
-        if not remote_id in self.remotes:
-            raise ClientBad("Remote id %s is not a valid client." % remote_id)
-
-        payload = json_dumps(payload)
-        secret = self.remotes[remote_id]
-
-        self.unsign(secret, timestamp, signature, payload, remote_id, *args, **kwa)
-
-
-class PyramidAuthApiServer(AuthApi):
-    """
-    """
-    def __init__(self, sender_id, remotes={}, passes=100, threshold=600,
-                    tight_threshold=15, time_provider=time.time,
-                    header_signature='', header_timestamp='',
-                    header_remoteid=''):
-        """
-        """
-        AuthApi.__init__(self, sender_id, remotes, passes, threshold, time.time)
-        self.tight_threshold = tight_threshold
-        self.header_signature = header_signature or 'X-Signature'
-        self.header_timestamp = header_timestamp or 'X-Signature-Timestamp'
-        self.header_remoteid = header_remoteid or 'X-Client-Id'
+    def parse_nonce(self, request):
+        return str(request.headers.get('X-Restauth-Signature-Nonce', ''))
 
     def send(self, request, response):
         """
@@ -121,17 +40,17 @@ class PyramidAuthApiServer(AuthApi):
         body = response.body.decode('utf-8')
         if body:
             # Prepare some data for signing.
-            remote_id = str(request.headers.get(self.header_remoteid, ''))
+            remote_id = self.parse_sender_id(request)
 
-            payload = json_loads(body)
-        
+            payload = json.loads(body)
+
             # Invoke the Api.
-            sig, now = AuthApi.send(self, remote_id, payload)
+            packet = JsonAuthApi.send(self, remote_id.encode(), payload)
 
             # Add HTTP Headers.
-            response.headers[self.header_signature] = sig
-            response.headers[self.header_timestamp] = now
-            response.headers[self.header_remoteid] = self.sender_id
+            response.headers['X-Restauth-Signature'] = packet['signature'].decode()
+            response.headers['X-Restauth-Signature-Nonce'] = packet['nonce'].decode()
+            response.headers['X-Restauth-Sender-Id'] = packet['sender_id'].decode()
 
     def receive(self, request, tight=True,
                     default_type=collections.OrderedDict):
@@ -139,33 +58,34 @@ class PyramidAuthApiServer(AuthApi):
         """
         # Get or construct a new payload.
         try:
-            payload = json_loads(request.body.decode('utf-8'))
+            payload = json.loads(request.body.decode('utf-8'))
         except ValueError:
             if default_type is dict:
                 default_type = collections.OrderedDict
             payload = default_type()
 
+
         # Prepare some data for unsigning. 
-        signature = str(request.headers.get(self.header_signature, ''))
-        timestamp = int(request.headers.get(self.header_timestamp, 0))
-        remote_id = str(request.headers.get(self.header_remoteid, ''))
+        signature = self.parse_signature(request)
+        remote_id = self.parse_sender_id(request)
+        nonce = self.parse_nonce(request)
+        auth_packet = {'payload': payload, 'signature': signature, 'nonce': nonce, 'sender_id': remote_id}
 
         def try_tight():
-            args = (request.client_addr,)
-            kwa = {'threshold': self.tight_threshold}
             # Invoke the Api.
-            AuthApi.receive(self, remote_id, timestamp, signature, payload, *args, **kwa)            
+            JsonAuthApi.receive(self, auth_packet,
+                                request.client_addr.encode(), expiry=self.tight_expiry)            
 
         if tight:
             try_tight()
         else:
-            args = ()
-            kwa = {}
             try:
                 # Try loose receive since tight is not required.
-                AuthApi.receive(self, remote_id, timestamp, signature, payload, *args, **kwa)
-            except AuthException:
-                # Now just run a tight receive in case those params were sent on the client.
+                JsonAuthApi.receive(self, auth_packet, expiry=self.expiry)
+            except SignatureException:
+                print ("trying tight ")
+                # Now just run a tight receive in case those params
+                #   were hashed on the client. Though, this shouldn't happen.
                 try_tight()
 
 
@@ -196,20 +116,23 @@ else:
         data = {'_addr': request.client_addr,
                 '_time': int(request.auth_api.time_provider())}
 
-        client_id = authenticated_userid(request);
+        remote_id = authenticated_userid(request)
 
-        if client_id:
-           data['clientId'] = client_id
+        if remote_id:
+            sender_id = request.auth_api.sender_id.decode()
+            secret = request.auth_api.remotes.get(remote_id.encode())[0]
+
+            data.update({'remotes': {
+                            sender_id: {
+                                'senderId': remote_id}}})
+                                #'secret': secret}}})
 
         return data
 
 
-    class RestAuthHelper(PyramidAuthApiServer):
-        def parse_userid(self, request):
-            return str(request.headers.get(self.header_remoteid, ''))
-
+    class RestAuthHelper(PyramidAuthApi):
         def add_client(self, client_id, secret):
-            self.remotes.update({client_id: secret})
+            self.remotes.update(client_id.encode(), (secret, ''))
 
 
     class RestAuthnPolicy(object):
@@ -221,6 +144,7 @@ else:
 
         def remember(self, request, principal, **kw):
             #print(**kw)
+            print (principal)
             self.helper.add_client(principal, kw['secret'])
             self.authenticated.add(principal)
 
@@ -228,32 +152,42 @@ else:
             print ("FORGET ME!")
 
         def unauthenticated_userid(self, request):
-            return self.helper.parse_userid(request)
+            return self.helper.parse_sender_id(request)
 
         def authenticated_userid(self, request):
-            userid = self.unauthenticated_userid(request)
+            userid = self.helper.parse_sender_id(request)
             if userid in self.authenticated:
                 return userid
 
         def effective_principals(self, request):
-            principals = [Everyone]
             request.set_property(lambda t: self.helper, 'auth_api')
-            remote_id = self.helper.parse_userid(request)
+            remote_id = self.helper.parse_sender_id(request)
 
             try:
                 self.helper.receive(request, tight=False)
-            except AuthException as e:
-                return principals
+            except SignatureException as e:
+                log.warn("Loose: Signature failed to verify. [%s]" % e)
+                return [Everyone]
+            except AuthException:
+                log.warn("Loose: Sender was not authorized.")
+                return [Everyone]
             else:
                 request.add_response_callback(self.helper.send)
 
                 try:
                     self.helper.receive(request, tight=True)
-                except AuthException as e:
-                    return principals + [Guest]
+                except SignatureException as e:
+                    log.warn("Tight: Signature failed to verify.")
+                    return [Everyone, Guest]
+                except AuthException:
+                    log.warn("Tight: Sender was not authorized.")
+                    return [Everyone]
                 else:
+                    print (remote_id)
                     if remote_id == 'guest':
-                        return principals + [TightGuest]
+                        log.info("Tight Guest!")
+                        return [Everyone, TightGuest]
                     else:
-                        return principals + [Authenticated, 
+                        log.info("Tight Authenticated!")
+                        return [Everyone, Authenticated, 
                                         'u:%s' % remote_id]

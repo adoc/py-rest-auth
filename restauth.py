@@ -58,7 +58,15 @@ class PyramidAuthApi(JsonAuthApi):
         JsonAuthApi.__init__(self, sender_id, remotes=Remotes(remotes))
         self.expiry = expiry
         self.tight_expiry = tight_expiry
-        
+
+    def build_client_defaults(self):
+        if b'guest' in self.remotes:
+            guest = self.remotes.get(b'guest')
+
+            return {'_any': {'secret': guest['secret'].decode(), 'senderId': 'guest'}}
+        else:
+            return {}
+
     def parse_sender_id(self, request):
         sender_id = str(request.headers.get('X-Restauth-Sender-Id', ''))
 
@@ -90,7 +98,10 @@ class PyramidAuthApi(JsonAuthApi):
             # Prepare some data for signing.
             remote_id, tight = self.parse_sender_id(request)
 
-            payload = json.loads(body)
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                payload = {}
 
             # Invoke the Api.
             try:
